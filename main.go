@@ -116,6 +116,11 @@ var (
 		Name: "udp_avg_interval_ms_window",
 		Help: "Average inter-arrival time per client in sliding window (ms).",
 	}, []string{"client"})
+
+	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_active_clients",
+		Help: "Number of active UDP clients.",
+	})
 )
 
 // ---------------------- 主程序 ----------------------
@@ -130,11 +135,11 @@ func main() {
 	flag.Parse()
 
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(jitterGauge, intervalGauge)
+	registry.MustRegister(jitterGauge, intervalGauge, activeClientsGauge)
 
 	// 客户端状态管理
 	clientWindows := make(map[string]*slidingWindow)
-	var mu sync.Mutex
+	var mu sync.RWMutex // 优化为读写锁
 
 	// 优雅退出
 	stop := make(chan struct{})
@@ -155,6 +160,7 @@ func main() {
 			case <-ticker.C:
 				now := time.Now()
 				mu.Lock()
+				activeCount := 0
 				for client, win := range clientWindows {
 					if !win.isActive(now) {
 						jitterGauge.DeleteLabelValues(client)
@@ -170,7 +176,9 @@ func main() {
 						jitterGauge.WithLabelValues(client).Set(jitter)
 						intervalGauge.WithLabelValues(client).Set(interval)
 					}
+					activeCount++
 				}
+				activeClientsGauge.Set(float64(activeCount))
 				mu.Unlock()
 			case <-stop:
 				return
@@ -208,20 +216,48 @@ func main() {
 				if !ok {
 					continue
 				}
+				// 可选：如需更精确可用五元组
 				srcIP := network.NetworkFlow().Src().String()
 				srcPort := udp.SrcPort.String()
+				// dstIP := network.NetworkFlow().Dst().String()
+				// dstPort := udp.DstPort.String()
+				// client := fmt.Sprintf("%s:%s-%s:%s", srcIP, srcPort, dstIP, dstPort)
 				client := fmt.Sprintf("%s:%s", srcIP, srcPort)
-				mu.Lock()
-				// 限制客户端数量，防止标签膨胀
-				if _, ok := clientWindows[client]; !ok {
-					if len(clientWindows) >= *maxClients {
-						mu.Unlock()
-						continue
-					}
-					clientWindows[client] = &slidingWindow{window: *window}
+
+				// 判空，防止 Metadata() 为 nil
+				meta := packet.Metadata()
+				if meta == nil {
+					continue
 				}
-				win := clientWindows[client]
-				win.add(sample{ts: packet.Metadata().Timestamp})
+
+				mu.RLock()
+				win, ok := clientWindows[client]
+				mu.RUnlock()
+				if !ok {
+					mu.Lock()
+					// 再次检查，防止并发下重复创建
+					if win, ok = clientWindows[client]; !ok {
+						if len(clientWindows) >= *maxClients {
+							mu.Unlock()
+							continue
+						}
+						win = &slidingWindow{window: *window}
+						clientWindows[client] = win
+					}
+					mu.Unlock()
+				}
+				win.add(sample{ts: meta.Timestamp})
+
+				// 主动清理过期客户端（防止短时间内暴涨）
+				now := time.Now()
+				mu.Lock()
+				for c, w := range clientWindows {
+					if !w.isActive(now) {
+						jitterGauge.DeleteLabelValues(c)
+						intervalGauge.DeleteLabelValues(c)
+						delete(clientWindows, c)
+					}
+				}
 				mu.Unlock()
 			case <-stop:
 				return
@@ -231,8 +267,10 @@ func main() {
 
 	// Prometheus HTTP
 	server := &http.Server{
-		Addr:    *metricsAddr,
-		Handler: promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		Addr:        *metricsAddr,
+		Handler:     promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		ReadTimeout: 5 * time.Second,
+		IdleTimeout: 5 * time.Second,
 	}
 	go func() {
 		log.Printf("Prometheus metrics available at %s/metrics\n", *metricsAddr)
@@ -243,11 +281,16 @@ func main() {
 
 	<-stop // 等待信号
 
-	// 优雅关闭 HTTP 服务
+	log.Println("Shutting down HTTP server...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server Shutdown: %v", err)
 	}
+
+	// 关闭抓包，确保抓包 goroutine 能退出
+	handle.Close()
+	time.Sleep(100 * time.Millisecond) // 给 goroutine 留点退出时间
+
 	log.Println("Exporter exited gracefully")
 }
