@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/gopacket"
@@ -34,30 +38,44 @@ func (w *slidingWindow) add(s sample) {
 	w.samples = append(w.samples, s)
 
 	// 清理窗口外的数据
+	// 优化：用二分查找提升清理效率
 	cutoff := now.Add(-w.window)
-	i := 0
-	for _, sm := range w.samples {
-		if sm.ts.After(cutoff) {
-			break
+	left, right := 0, len(w.samples)
+	for left < right {
+		mid := (left + right) / 2
+		if w.samples[mid].ts.Before(cutoff) {
+			left = mid + 1
+		} else {
+			right = mid
 		}
-		i++
 	}
-	if i > 0 {
-		w.samples = w.samples[i:]
+	if left > 0 {
+		w.samples = w.samples[left:]
 	}
 }
 
-func (w *slidingWindow) metrics() (lossRate float64, jitter float64, avgInterval float64) {
+func (w *slidingWindow) isActive(now time.Time) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.samples) == 0 {
+		return false
+	}
+	// 只要窗口内有数据在 [now-window, now] 范围内就算活跃
+	cutoff := now.Add(-w.window)
+	return w.samples[len(w.samples)-1].ts.After(cutoff)
+}
+
+func (w *slidingWindow) metrics() (jitter float64, avgInterval float64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	n := len(w.samples)
 	if n < 2 {
-		return 0, 0, 0
+		return 0, 0
 	}
 
 	// 到达间隔
-	var intervals []float64
+	intervals := make([]float64, 0, n-1)
 	for i := 1; i < n; i++ {
 		iv := w.samples[i].ts.Sub(w.samples[i-1].ts).Seconds() * 1000 // ms
 		intervals = append(intervals, iv)
@@ -83,31 +101,12 @@ func (w *slidingWindow) metrics() (lossRate float64, jitter float64, avgInterval
 		jitter = jitterSum / float64(len(intervals)-1)
 	}
 
-	// 丢包率估算 (基于 interval 假设): 如果平均间隔明显偏大，可推测丢包
-	// 简化：假设理想间隔为最小间隔
-	minInterval := intervals[0]
-	for _, iv := range intervals {
-		if iv < minInterval {
-			minInterval = iv
-		}
-	}
-	expected := (w.samples[n-1].ts.Sub(w.samples[0].ts)).Seconds() * 1000 / minInterval
-	lossRate = 1 - float64(len(intervals))/expected
-	if lossRate < 0 {
-		lossRate = 0
-	}
-
 	return
 }
 
 // ---------------------- Prometheus 指标 ----------------------
 
 var (
-	lossGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "udp_loss_rate_window",
-		Help: "Estimated packet loss rate per client (0~1).",
-	}, []string{"client"})
-
 	jitterGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_avg_jitter_ms_window",
 		Help: "Average jitter per client in sliding window (ms).",
@@ -127,25 +126,55 @@ func main() {
 	window := flag.Duration("window", 30*time.Second, "Sliding window duration (e.g. 30s, 1m)")
 	metricsAddr := flag.String("metrics", ":2112", "Prometheus metrics HTTP listen address")
 	filter := flag.String("filter", "udp", "BPF filter (e.g. 'udp and port 9000')")
+	maxClients := flag.Int("max_clients", 10000, "Maximum number of tracked clients")
 	flag.Parse()
 
-	prometheus.MustRegister(lossGauge, jitterGauge, intervalGauge)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(jitterGauge, intervalGauge)
 
 	// 客户端状态管理
 	clientWindows := make(map[string]*slidingWindow)
 	var mu sync.Mutex
 
-	// 定时更新 Prometheus
+	// 优雅退出
+	stop := make(chan struct{})
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		for range time.Tick(1 * time.Second) {
-			mu.Lock()
-			for client, win := range clientWindows {
-				loss, jitter, interval := win.metrics()
-				lossGauge.WithLabelValues(client).Set(loss)
-				jitterGauge.WithLabelValues(client).Set(jitter)
-				intervalGauge.WithLabelValues(client).Set(interval)
+		<-sig
+		close(stop)
+	}()
+
+	// 定时更新 Prometheus
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				now := time.Now()
+				mu.Lock()
+				for client, win := range clientWindows {
+					if !win.isActive(now) {
+						jitterGauge.DeleteLabelValues(client)
+						intervalGauge.DeleteLabelValues(client)
+						delete(clientWindows, client)
+						continue
+					}
+					jitter, interval := win.metrics()
+					win.mu.Lock()
+					hasData := len(win.samples) > 1
+					win.mu.Unlock()
+					if hasData {
+						jitterGauge.WithLabelValues(client).Set(jitter)
+						intervalGauge.WithLabelValues(client).Set(interval)
+					}
+				}
+				mu.Unlock()
+			case <-stop:
+				return
 			}
-			mu.Unlock()
 		}
 	}()
 
@@ -161,34 +190,64 @@ func main() {
 	}
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	for packet := range packetSource.Packets() {
-		// 提取五元组
-		network := packet.NetworkLayer()
-		transport := packet.TransportLayer()
-		if network == nil || transport == nil {
-			continue
+	go func() {
+		for {
+			select {
+			case packet, ok := <-packetSource.Packets():
+				if !ok {
+					return
+				}
+				// ...处理 packet ...
+				// 提取五元组
+				network := packet.NetworkLayer()
+				transport := packet.TransportLayer()
+				if network == nil || transport == nil {
+					continue
+				}
+				udp, ok := transport.(*layers.UDP)
+				if !ok {
+					continue
+				}
+				srcIP := network.NetworkFlow().Src().String()
+				srcPort := udp.SrcPort.String()
+				client := fmt.Sprintf("%s:%s", srcIP, srcPort)
+				mu.Lock()
+				// 限制客户端数量，防止标签膨胀
+				if _, ok := clientWindows[client]; !ok {
+					if len(clientWindows) >= *maxClients {
+						mu.Unlock()
+						continue
+					}
+					clientWindows[client] = &slidingWindow{window: *window}
+				}
+				win := clientWindows[client]
+				win.add(sample{ts: packet.Metadata().Timestamp})
+				mu.Unlock()
+			case <-stop:
+				return
+			}
 		}
-		udp, ok := transport.(*layers.UDP)
-		if !ok {
-			continue
-		}
-
-		srcIP := network.NetworkFlow().Src().String()
-		srcPort := udp.SrcPort.String()
-		client := fmt.Sprintf("%s:%s", srcIP, srcPort)
-
-		mu.Lock()
-		win, ok := clientWindows[client]
-		if !ok {
-			win = &slidingWindow{window: *window}
-			clientWindows[client] = win
-		}
-		win.add(sample{ts: packet.Metadata().Timestamp})
-		mu.Unlock()
-	}
+	}()
 
 	// Prometheus HTTP
-	http.Handle("/metrics", promhttp.Handler())
-	log.Printf("Prometheus metrics available at %s/metrics\n", *metricsAddr)
-	log.Fatal(http.ListenAndServe(*metricsAddr, nil))
+	server := &http.Server{
+		Addr:    *metricsAddr,
+		Handler: promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+	}
+	go func() {
+		log.Printf("Prometheus metrics available at %s/metrics\n", *metricsAddr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server error: %v", err)
+		}
+	}()
+
+	<-stop // 等待信号
+
+	// 优雅关闭 HTTP 服务
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server Shutdown: %v", err)
+	}
+	log.Println("Exporter exited gracefully")
 }
