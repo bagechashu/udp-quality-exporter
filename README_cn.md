@@ -52,3 +52,12 @@ nc -l -u -p 9000
 nc -u <server-ip> 9000
 
 ```
+
+### Other
+
+查看 MTU
+
+```
+ip link
+
+```

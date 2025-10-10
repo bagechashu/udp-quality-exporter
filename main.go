@@ -158,10 +158,19 @@ func main() {
 	iface := flag.String("iface", "eth0", "Network interface to capture")
 	window := flag.Duration("window", 30*time.Second, "Sliding window duration (e.g. 30s, 1m)")
 	metricsAddr := flag.String("metrics", ":2112", "Prometheus metrics HTTP listen address")
-	filter := flag.String("filter", "udp", "BPF filter (e.g. 'udp and port 9000')")
+	filterPort := flag.Int("filter_port", 0, "BPF filter (e.g. '9000')")
 	maxClients := flag.Int("max_clients", 100, "Maximum number of tracked clients")
 	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window")
 	flag.Parse()
+
+	var filterStr string
+	if *filterPort > 0 && *filterPort < 65535 {
+		filterStr = fmt.Sprintf("udp and port %d", *filterPort)
+	} else if *filterPort == 0 {
+		filterStr = "udp"
+	} else {
+		log.Fatalf("Invalid filter_port: %d", *filterPort)
+	}
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(jitterGauge, intervalGauge, activeClientsGauge, droppedClientsCounter)
@@ -204,6 +213,7 @@ func main() {
 	}()
 
 	// 抓包
+	// 网卡配置 MTU 一般 为 1500 字节，加上以太网头部 14 字节，设置 1600 字节足够
 	handle, err := pcap.OpenLive(*iface, 1600, true, pcap.BlockForever)
 	if err != nil {
 		log.Printf("Failed to open interface %s: %v", *iface, err)
@@ -211,8 +221,8 @@ func main() {
 	}
 	defer handle.Close()
 
-	if err := handle.SetBPFFilter(*filter); err != nil {
-		log.Printf("Failed to set BPF filter '%s': %v", *filter, err)
+	if err := handle.SetBPFFilter(filterStr); err != nil {
+		log.Printf("Failed to set BPF filter '%s': %v", filterStr, err)
 		return
 	}
 
