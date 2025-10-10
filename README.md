@@ -3,10 +3,16 @@
 ### Usage
 
 ```bash
+# Debian-based systems
+sudo apt-get install libpcap-dev
+# RHEL-based systems
+sudo dnf install libpcap-devel
+
+# compilation
 env GOOS=linux GOARCH=amd64 go build -o udp-quality-exporter
 
 # Capture UDP packets on eth0 port 9000, 30s sliding window, Prometheus metrics exposed on port 2112
-sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter_port 9000
+sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter_ports 9000,9001
 
 # Default values
 sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --max_clients 100 --window_buffer_cap 1
@@ -31,17 +37,6 @@ Suggestions:
 
 You can adjust the window length via the parameter and choose the best value for your business scenario.
 
-
-### System Dependencies
-
-```bash
-# Debian-based systems
-sudo apt-get install libpcap-dev
-
-# RHEL-based systems
-sudo dnf install libpcap-devel
-
-```
 
 ### Testing 
 

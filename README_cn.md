@@ -3,13 +3,19 @@
 ### Usage
 
 ```bash
+# Debian-based systems
+sudo apt-get install libpcap-dev
+# RHEL-based systems
+sudo dnf install libpcap-devel
+
+# 编译
 env GOOS=linux GOARCH=amd64 go build -o udp-quality-exporter
 
 # 抓取 eth0 上 9000 端口 UDP，窗口 30s，Prometheus metrics 暴露在 2112 端口
-sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter "udp and port 9000"
+sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter_ports 9000,9001
 
 # 参数与默认值
-sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter "udp" --max_clients 100 --window_buffer_cap 1
+sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --max_clients 100 --window_buffer_cap 1
 
 ```
 
@@ -28,17 +34,6 @@ sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter "
 
 你可以把窗口长度做成参数，实际业务中观察下效果，选择最适合你业务的窗口长度。
 
-
-### System Dependencies
-
-```bash
-# Debian-based systems
-sudo apt-get install libpcap-dev
-
-# RHEL-based systems
-sudo dnf install libpcap-devel
-
-```
 
 ### Testing 
 
