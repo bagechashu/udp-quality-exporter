@@ -12,9 +12,7 @@ import (
 	"time"
 
 	"github.com/google/gopacket"
-	"github.com/google/gopacket/afpacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/gopacket/pcap"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -187,57 +185,6 @@ var (
 		Help: "Total number of UDP clients dropped due to max_clients limit.",
 	})
 )
-
-//
-// ---------------------- 抓包实现：pcap ----------------------
-//
-
-func captureWithPcap(iface, filter string, handlePacket func(gopacket.Packet)) error {
-	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
-	if err != nil {
-		return fmt.Errorf("pcap open failed: %w", err)
-	}
-	defer handle.Close()
-
-	if filter != "" {
-		if err := handle.SetBPFFilter(filter); err != nil {
-			return fmt.Errorf("set BPF failed: %w", err)
-		}
-	}
-
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	log.Printf("[pcap] capturing on %s, filter=%s", iface, filter)
-	for packet := range packetSource.Packets() {
-		handlePacket(packet)
-	}
-	return nil
-}
-
-//
-// ---------------------- 抓包实现：afpacket ----------------------
-//
-
-func captureWithAfpacket(iface string, handlePacket func(gopacket.Packet)) error {
-	handle, err := afpacket.NewTPacket(
-		afpacket.OptInterface(iface),
-		afpacket.OptFrameSize(4096),
-		afpacket.OptBlockSize(4096*512),
-		afpacket.OptNumBlocks(128),
-		afpacket.OptPollTimeout(50*time.Millisecond),
-	)
-	if err != nil {
-		return fmt.Errorf("afpacket open failed: %w", err)
-	}
-	defer handle.Close()
-
-	packetSource := gopacket.NewPacketSource(handle, layers.LinkTypeEthernet)
-	log.Printf("[afpacket] capturing on %s", iface)
-
-	for packet := range packetSource.Packets() {
-		handlePacket(packet)
-	}
-	return nil
-}
 
 //
 // ---------------------- 主程序入口 ----------------------

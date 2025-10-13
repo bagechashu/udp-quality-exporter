@@ -9,6 +9,9 @@ sudo apt-get install libpcap-dev
 sudo dnf install libpcap-devel
 
 # 编译
+# with pcap
+env GOOS=linux GOARCH=amd64 go build -tags pcap -o udp-quality-exporter
+# without pcap
 env GOOS=linux GOARCH=amd64 go build -o udp-quality-exporter
 
 # 抓取 eth0 上 9000 端口 UDP，窗口 30s，Prometheus metrics 暴露在 2112 端口

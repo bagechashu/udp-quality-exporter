@@ -9,6 +9,9 @@ sudo apt-get install libpcap-dev
 sudo dnf install libpcap-devel
 
 # compilation
+# with pcap
+env GOOS=linux GOARCH=amd64 go build -tags pcap -o udp-quality-exporter
+# without pcap
 env GOOS=linux GOARCH=amd64 go build -o udp-quality-exporter
 
 # Capture UDP packets on eth0 port 9000, 30s sliding window, Prometheus metrics exposed on port 2112
