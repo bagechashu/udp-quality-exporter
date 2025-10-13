@@ -15,7 +15,7 @@ env GOOS=linux GOARCH=amd64 go build -o udp-quality-exporter
 sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter_ports 9000,9001
 
 # Default values
-sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --max_clients 100 --window_buffer_cap 1
+sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --max_clients 100 --window_buffer_cap 1 --mode pcap --debug
 
 ```
 

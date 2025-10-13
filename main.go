@@ -140,15 +140,17 @@ func (w *slidingWindow) metrics() (jitter float64, avgInterval float64) {
 //
 
 var (
-	jitterGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "udp_avg_jitter_ms_window",
-		Help: "Average jitter per client in sliding window (ms).",
-	}, []string{"client"})
+	udpJitterSummary = prometheus.NewSummary(prometheus.SummaryOpts{
+		Name:       "udp_jitter_ms_summary",
+		Help:       "Jitter distribution across all active UDP clients (ms).",
+		Objectives: map[float64]float64{0.5: 0.01, 0.9: 0.01, 0.99: 0.001},
+	})
 
-	intervalGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "udp_avg_interval_ms_window",
-		Help: "Average inter-arrival time per client in sliding window (ms).",
-	}, []string{"client"})
+	udpIntervalSummary = prometheus.NewSummary(prometheus.SummaryOpts{
+		Name:       "udp_interval_ms_summary",
+		Help:       "Packet inter-arrival interval distribution across all clients (ms).",
+		Objectives: map[float64]float64{0.5: 0.01, 0.9: 0.01, 0.99: 0.001},
+	})
 
 	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
@@ -205,7 +207,6 @@ func captureWithAfpacket(iface string, filterPorts map[int]bool, handlePacket fu
 	log.Printf("[afpacket] capturing on %s", iface)
 
 	for packet := range packetSource.Packets() {
-		// 过滤端口（由 handlePacket 内部再次判断）
 		handlePacket(packet)
 	}
 	return nil
@@ -252,7 +253,7 @@ func main() {
 
 	// ---------------------- Prometheus 注册 ----------------------
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(jitterGauge, intervalGauge, activeClientsGauge, droppedClientsCounter)
+	registry.MustRegister(udpJitterSummary, udpIntervalSummary, activeClientsGauge, droppedClientsCounter)
 
 	clientWindows := make(map[string]*slidingWindow)
 	var mu sync.RWMutex
@@ -268,19 +269,26 @@ func main() {
 			activeCount := 0
 			for client, win := range clientWindows {
 				if !win.isActive(now) {
-					jitterGauge.DeleteLabelValues(client)
-					intervalGauge.DeleteLabelValues(client)
 					delete(clientWindows, client)
 					continue
 				}
 				jitter, interval := win.metrics()
+
+				// 探测包过滤逻辑
 				win.mu.Lock()
-				hasData := win.buffer.size > 1
+				isProbe := win.buffer.size < 3
 				win.mu.Unlock()
-				if hasData {
-					jitterGauge.WithLabelValues(client).Set(jitter)
-					intervalGauge.WithLabelValues(client).Set(interval)
+				if isProbe {
+					continue
 				}
+
+				if jitter > 0 {
+					udpJitterSummary.Observe(jitter)
+				}
+				if interval > 0 {
+					udpIntervalSummary.Observe(interval)
+				}
+
 				activeCount++
 			}
 			activeClientsGauge.Set(float64(activeCount))
@@ -314,6 +322,11 @@ func main() {
 
 		meta := packet.Metadata()
 		if meta == nil {
+			return
+		}
+
+		// 时间戳过滤, 过滤掉乱序或系统异常时间戳（时间差过大）
+		if time.Since(meta.Timestamp) > 10*time.Second || meta.Timestamp.After(time.Now().Add(2*time.Second)) {
 			return
 		}
 
