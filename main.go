@@ -36,6 +36,9 @@ type ringBuffer struct {
 }
 
 func newRingBuffer(capacity int) *ringBuffer {
+	if capacity <= 0 {
+		capacity = 16
+	}
 	return &ringBuffer{
 		data: make([]sample, capacity),
 		cap:  capacity,
@@ -61,13 +64,16 @@ func (r *ringBuffer) slice() []sample {
 }
 
 func (r *ringBuffer) trimBefore(cutoff time.Time) {
+	// 移动 start，减少 size
 	n := r.size
 	idx := 0
 	for idx < n && r.data[(r.start+idx)%r.cap].ts.Before(cutoff) {
 		idx++
 	}
-	r.start = (r.start + idx) % r.cap
-	r.size -= idx
+	if idx > 0 {
+		r.start = (r.start + idx) % r.cap
+		r.size -= idx
+	}
 }
 
 // 滑动窗口结构
@@ -78,6 +84,9 @@ type slidingWindow struct {
 }
 
 func newSlidingWindow(window time.Duration, cap int) *slidingWindow {
+	if cap <= 0 {
+		cap = 16
+	}
 	return &slidingWindow{
 		buffer: newRingBuffer(cap),
 		window: window,
@@ -101,6 +110,17 @@ func (w *slidingWindow) isActive(now time.Time) bool {
 	cutoff := now.Add(-w.window)
 	samples := w.buffer.slice()
 	return samples[len(samples)-1].ts.After(cutoff)
+}
+
+// last 返回窗口中最后一个样本的时间戳，如果没有样本返回零时间并返回 false
+func (w *slidingWindow) last() (time.Time, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.buffer.size == 0 {
+		return time.Time{}, false
+	}
+	samples := w.buffer.slice()
+	return samples[len(samples)-1].ts, true
 }
 
 func (w *slidingWindow) metrics() (jitter float64, avgInterval float64) {
@@ -157,6 +177,11 @@ var (
 		Help: "Number of active UDP clients.",
 	})
 
+	activeStreamsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_active_streams",
+		Help: "Number of active UDP streams.",
+	})
+
 	droppedClientsCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "udp_dropped_clients_total",
 		Help: "Total number of UDP clients dropped due to max_clients limit.",
@@ -174,8 +199,10 @@ func captureWithPcap(iface, filter string, handlePacket func(gopacket.Packet)) e
 	}
 	defer handle.Close()
 
-	if err := handle.SetBPFFilter(filter); err != nil {
-		return fmt.Errorf("set BPF failed: %w", err)
+	if filter != "" {
+		if err := handle.SetBPFFilter(filter); err != nil {
+			return fmt.Errorf("set BPF failed: %w", err)
+		}
 	}
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
@@ -190,7 +217,7 @@ func captureWithPcap(iface, filter string, handlePacket func(gopacket.Packet)) e
 // ---------------------- 抓包实现：afpacket ----------------------
 //
 
-func captureWithAfpacket(iface string, filterPorts map[int]bool, handlePacket func(gopacket.Packet)) error {
+func captureWithAfpacket(iface string, handlePacket func(gopacket.Packet)) error {
 	handle, err := afpacket.NewTPacket(
 		afpacket.OptInterface(iface),
 		afpacket.OptFrameSize(4096),
@@ -224,7 +251,7 @@ func main() {
 	metricsAddr := flag.String("metrics", ":2112", "Prometheus metrics HTTP listen address")
 	filterPorts := flag.String("filter_ports", "", "Comma-separated UDP ports to filter (e.g. '9000,9001')")
 	maxClients := flag.Int("max_clients", 100, "Maximum number of tracked clients")
-	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window")
+	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window (base 1024)")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
@@ -246,6 +273,7 @@ func main() {
 			filterPortsSet[num] = true
 			exprs = append(exprs, fmt.Sprintf("port %d", num))
 		}
+		// pcap filter
 		filterStr = fmt.Sprintf("udp and (%s)", strings.Join(exprs, " or "))
 	} else {
 		filterStr = "udp"
@@ -253,11 +281,22 @@ func main() {
 
 	// ---------------------- Prometheus 注册 ----------------------
 	registry := prometheus.NewRegistry()
-	registry.MustRegister(udpJitterSummary, udpIntervalSummary, activeClientsGauge, droppedClientsCounter)
+	registry.MustRegister(
+		udpJitterSummary,
+		udpIntervalSummary,
+		activeClientsGauge,
+		activeStreamsGauge,
+		droppedClientsCounter,
+	)
 
 	clientWindows := make(map[string]*slidingWindow)
 	var mu sync.RWMutex
+
+	// buffer capacity multiplier: base 1024 * times
 	windowBufferCap := 1024 * (*windowBufferCapTimes)
+	if windowBufferCap <= 0 {
+		windowBufferCap = 1024
+	}
 
 	// ---------------------- 指标定时更新 ----------------------
 	go func() {
@@ -266,15 +305,18 @@ func main() {
 		for range ticker.C {
 			now := time.Now()
 			mu.Lock()
-			activeCount := 0
+			activeClients := 0
+			activeStreams := 0
+			// 遍历 clientWindows
 			for client, win := range clientWindows {
 				if !win.isActive(now) {
+					// 超过窗口范围，删除
 					delete(clientWindows, client)
 					continue
 				}
 				jitter, interval := win.metrics()
 
-				// 探测包过滤逻辑
+				// 探测包过滤逻辑（简单版：窗口内样本数少于 3 认为是探测/异常）
 				win.mu.Lock()
 				isProbe := win.buffer.size < 3
 				win.mu.Unlock()
@@ -282,6 +324,7 @@ func main() {
 					continue
 				}
 
+				// 汇总全局分布
 				if jitter > 0 {
 					udpJitterSummary.Observe(jitter)
 				}
@@ -289,9 +332,17 @@ func main() {
 					udpIntervalSummary.Observe(interval)
 				}
 
-				activeCount++
+				activeClients++
+
+				// 如果最近一个包在 1 秒内，则认为是活跃流
+				if last, ok := win.last(); ok {
+					if now.Sub(last) < 1*time.Second {
+						activeStreams++
+					}
+				}
 			}
-			activeClientsGauge.Set(float64(activeCount))
+			activeClientsGauge.Set(float64(activeClients))
+			activeStreamsGauge.Set(float64(activeStreams))
 			mu.Unlock()
 		}
 	}()
@@ -308,7 +359,7 @@ func main() {
 			return
 		}
 
-		// 端口过滤逻辑
+		// 端口过滤逻辑（pcap 模式已经做 bpf，但 afpacket 不会）
 		if len(filterPortsSet) > 0 {
 			port := int(udp.DstPort)
 			if !filterPortsSet[port] {
@@ -330,11 +381,13 @@ func main() {
 			return
 		}
 
+		// 查找或创建 window
 		mu.RLock()
 		win, ok := clientWindows[client]
 		mu.RUnlock()
 		if !ok {
 			mu.Lock()
+			// double-check
 			if win, ok = clientWindows[client]; !ok {
 				if len(clientWindows) >= *maxClients {
 					droppedClientsCounter.Inc()
@@ -363,7 +416,7 @@ func main() {
 			if runtime.GOOS != "linux" {
 				log.Fatalf("AF_PACKET mode only supported on Linux")
 			}
-			if err := captureWithAfpacket(*iface, filterPortsSet, handlePacket); err != nil {
+			if err := captureWithAfpacket(*iface, handlePacket); err != nil {
 				log.Fatalf("AF_PACKET error: %v", err)
 			}
 		default:
