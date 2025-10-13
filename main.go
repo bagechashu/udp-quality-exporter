@@ -5,18 +5,23 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/afpacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+//
+// ---------------------- 数据结构 ----------------------
+//
 
 type sample struct {
 	ts time.Time
@@ -65,7 +70,7 @@ func (r *ringBuffer) trimBefore(cutoff time.Time) {
 	r.size -= idx
 }
 
-// 修改 slidingWindow 用 ringBuffer
+// 滑动窗口结构
 type slidingWindow struct {
 	mu     sync.Mutex
 	buffer *ringBuffer
@@ -130,7 +135,9 @@ func (w *slidingWindow) metrics() (jitter float64, avgInterval float64) {
 	return
 }
 
+//
 // ---------------------- Prometheus 指标 ----------------------
+//
 
 var (
 	jitterGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -154,59 +161,104 @@ var (
 	})
 )
 
-// ---------------------- 主程序 ----------------------
+//
+// ---------------------- 抓包实现：pcap ----------------------
+//
+
+func captureWithPcap(iface, filter string, handlePacket func(gopacket.Packet)) error {
+	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
+	if err != nil {
+		return fmt.Errorf("pcap open failed: %w", err)
+	}
+	defer handle.Close()
+
+	if err := handle.SetBPFFilter(filter); err != nil {
+		return fmt.Errorf("set BPF failed: %w", err)
+	}
+
+	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+	log.Printf("[pcap] capturing on %s, filter=%s", iface, filter)
+	for packet := range packetSource.Packets() {
+		handlePacket(packet)
+	}
+	return nil
+}
+
+//
+// ---------------------- 抓包实现：afpacket ----------------------
+//
+
+func captureWithAfpacket(iface string, filterPorts map[int]bool, handlePacket func(gopacket.Packet)) error {
+	handle, err := afpacket.NewTPacket(
+		afpacket.OptInterface(iface),
+		afpacket.OptFrameSize(4096),
+		afpacket.OptBlockSize(4096*512),
+		afpacket.OptNumBlocks(128),
+		afpacket.OptPollTimeout(50*time.Millisecond),
+	)
+	if err != nil {
+		return fmt.Errorf("afpacket open failed: %w", err)
+	}
+	defer handle.Close()
+
+	packetSource := gopacket.NewPacketSource(handle, layers.LinkTypeEthernet)
+	log.Printf("[afpacket] capturing on %s", iface)
+
+	for packet := range packetSource.Packets() {
+		// 过滤端口（由 handlePacket 内部再次判断）
+		handlePacket(packet)
+	}
+	return nil
+}
+
+//
+// ---------------------- 主程序入口 ----------------------
+//
 
 func main() {
-	// 参数
+	// 参数定义
+	mode := flag.String("mode", "pcap", "Capture mode: 'pcap' or 'afpacket'")
 	iface := flag.String("iface", "eth0", "Network interface to capture")
 	window := flag.Duration("window", 30*time.Second, "Sliding window duration (e.g. 30s, 1m)")
 	metricsAddr := flag.String("metrics", ":2112", "Prometheus metrics HTTP listen address")
 	filterPorts := flag.String("filter_ports", "", "Comma-separated UDP ports to filter (e.g. '9000,9001')")
 	maxClients := flag.Int("max_clients", 100, "Maximum number of tracked clients")
 	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window")
+	debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
+	// ---------------------- 端口过滤 ----------------------
+	var filterPortsSet map[int]bool
 	var filterStr string
 	if *filterPorts != "" {
-		ports := strings.Split(*filterPorts, ",")
-		var portExprs []string
-		for _, p := range ports {
+		filterPortsSet = make(map[int]bool)
+		var exprs []string
+		for _, p := range strings.Split(*filterPorts, ",") {
 			p = strings.TrimSpace(p)
 			if p == "" {
 				continue
 			}
-
-			// 判断是否为合法数字
 			num, err := strconv.Atoi(p)
 			if err != nil || num < 0 || num > 65535 {
-				log.Fatalf("Invalid port number: %q (must be 0-65535)", p)
-				os.Exit(1)
+				log.Fatalf("Invalid port number: %q", p)
 			}
-
-			portExprs = append(portExprs, fmt.Sprintf("port %d", num))
+			filterPortsSet[num] = true
+			exprs = append(exprs, fmt.Sprintf("port %d", num))
 		}
-
-		if len(portExprs) == 0 {
-			log.Fatalf("No valid UDP ports provided in --filter_ports=%q", *filterPorts)
-			os.Exit(1)
-		}
-
-		filterStr = fmt.Sprintf("udp and (%s)", strings.Join(portExprs, " or "))
+		filterStr = fmt.Sprintf("udp and (%s)", strings.Join(exprs, " or "))
 	} else {
 		filterStr = "udp"
 	}
 
+	// ---------------------- Prometheus 注册 ----------------------
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(jitterGauge, intervalGauge, activeClientsGauge, droppedClientsCounter)
 
-	// 客户端状态管理
 	clientWindows := make(map[string]*slidingWindow)
-	var mu sync.RWMutex // 优化为读写锁
+	var mu sync.RWMutex
+	windowBufferCap := 1024 * (*windowBufferCapTimes)
 
-	// 计算环形缓冲区容量，windowBufferCapTimes 作为乘数参数
-	windowBufferCap := 1024 * (*windowBufferCapTimes) // 环形缓冲区容量，可根据实际流量调整
-
-	// 定时更新 Prometheus
+	// ---------------------- 指标定时更新 ----------------------
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
@@ -236,81 +288,84 @@ func main() {
 		}
 	}()
 
-	// 抓包
-	// 网卡配置 MTU 一般 为 1500 字节，加上以太网头部 14 字节，设置 1600 字节足够
-	handle, err := pcap.OpenLive(*iface, 1600, true, pcap.BlockForever)
-	if err != nil {
-		log.Printf("Failed to open interface %s: %v", *iface, err)
-		return
-	}
-	defer handle.Close()
+	// ---------------------- 通用包处理函数 ----------------------
+	handlePacket := func(packet gopacket.Packet) {
+		network := packet.NetworkLayer()
+		transport := packet.TransportLayer()
+		if network == nil || transport == nil {
+			return
+		}
+		udp, ok := transport.(*layers.UDP)
+		if !ok {
+			return
+		}
 
-	if err := handle.SetBPFFilter(filterStr); err != nil {
-		log.Printf("Failed to set BPF filter '%s': %v", filterStr, err)
-		return
-	}
-
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	go func() {
-		for packet := range packetSource.Packets() {
-			// ...处理 packet ...
-			// 提取五元组
-			network := packet.NetworkLayer()
-			transport := packet.TransportLayer()
-			if network == nil || transport == nil {
-				continue
+		// 端口过滤逻辑
+		if len(filterPortsSet) > 0 {
+			port := int(udp.DstPort)
+			if !filterPortsSet[port] {
+				return
 			}
-			udp, ok := transport.(*layers.UDP)
-			if !ok {
-				continue
-			}
-			// 可选：如需更精确可用五元组
-			srcIP := network.NetworkFlow().Src().String()
-			srcPort := udp.SrcPort.String()
-			// dstIP := network.NetworkFlow().Dst().String()
-			// dstPort := udp.DstPort.String()
-			// client := fmt.Sprintf("%s:%s-%s:%s", srcIP, srcPort, dstIP, dstPort)
+		}
 
-			client := fmt.Sprintf("%s:%s", srcIP, srcPort)
+		srcIP := network.NetworkFlow().Src().String()
+		srcPort := udp.SrcPort.String()
+		client := fmt.Sprintf("%s:%s", srcIP, srcPort)
 
-			// 判空，防止 Metadata() 为 nil
-			meta := packet.Metadata()
-			if meta == nil {
-				continue
-			}
+		meta := packet.Metadata()
+		if meta == nil {
+			return
+		}
 
-			mu.RLock()
-			win, ok := clientWindows[client]
-			mu.RUnlock()
-			if !ok {
-				mu.Lock()
-				// 再次检查，防止并发下重复创建
-				if win, ok = clientWindows[client]; !ok {
-					if len(clientWindows) >= *maxClients {
-						droppedClientsCounter.Inc()
-						log.Printf("Max clients reached (%d), dropping new client: %s", *maxClients, client)
-						mu.Unlock()
-						continue
+		mu.RLock()
+		win, ok := clientWindows[client]
+		mu.RUnlock()
+		if !ok {
+			mu.Lock()
+			if win, ok = clientWindows[client]; !ok {
+				if len(clientWindows) >= *maxClients {
+					droppedClientsCounter.Inc()
+					if *debug {
+						log.Printf("Max clients reached (%d), dropping: %s", *maxClients, client)
 					}
-					win = newSlidingWindow(*window, windowBufferCap)
-					clientWindows[client] = win
+					mu.Unlock()
+					return
 				}
-				mu.Unlock()
+				win = newSlidingWindow(*window, windowBufferCap)
+				clientWindows[client] = win
 			}
-			win.add(sample{ts: meta.Timestamp})
+			mu.Unlock()
+		}
+		win.add(sample{ts: meta.Timestamp})
+	}
 
-			// 已移除高频 map 清理逻辑
+	// ---------------------- 启动抓包 ----------------------
+	go func() {
+		switch *mode {
+		case "pcap":
+			if err := captureWithPcap(*iface, filterStr, handlePacket); err != nil {
+				log.Fatalf("PCAP error: %v", err)
+			}
+		case "afpacket":
+			if runtime.GOOS != "linux" {
+				log.Fatalf("AF_PACKET mode only supported on Linux")
+			}
+			if err := captureWithAfpacket(*iface, filterPortsSet, handlePacket); err != nil {
+				log.Fatalf("AF_PACKET error: %v", err)
+			}
+		default:
+			log.Fatalf("Unknown mode: %s (must be 'pcap' or 'afpacket')", *mode)
 		}
 	}()
 
-	// Prometheus HTTP
+	// ---------------------- 启动 Prometheus HTTP ----------------------
 	server := &http.Server{
 		Addr:        *metricsAddr,
 		Handler:     promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
 		ReadTimeout: 5 * time.Second,
 		IdleTimeout: 5 * time.Second,
 	}
-	log.Printf("Prometheus metrics available at %s/metrics\n", *metricsAddr)
+	log.Printf("Prometheus metrics available at %s/metrics", *metricsAddr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server error: %v", err)
 	}
