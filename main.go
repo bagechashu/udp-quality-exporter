@@ -17,9 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-//
-// ---------------------- 数据结构 ----------------------
-//
+// ---------------------- 基础结构 ----------------------
 
 type sample struct {
 	ts time.Time
@@ -33,14 +31,11 @@ type ringBuffer struct {
 	cap   int
 }
 
-func newRingBuffer(capacity int) *ringBuffer {
-	if capacity <= 0 {
-		capacity = 16
+func newRingBuffer(cap int) *ringBuffer {
+	if cap <= 0 {
+		cap = 16
 	}
-	return &ringBuffer{
-		data: make([]sample, capacity),
-		cap:  capacity,
-	}
+	return &ringBuffer{data: make([]sample, cap), cap: cap}
 }
 
 func (r *ringBuffer) append(s sample) {
@@ -61,7 +56,7 @@ func (r *ringBuffer) slice() []sample {
 	return out
 }
 
-func (r *ringBuffer) trimBefore(cutoff time.Time) {
+func (r *ringBuffer) trimBeforeFast(cutoff time.Time) {
 	// 移动 start，减少 size
 	n := r.size
 	idx := 0
@@ -71,6 +66,13 @@ func (r *ringBuffer) trimBefore(cutoff time.Time) {
 	if idx > 0 {
 		r.start = (r.start + idx) % r.cap
 		r.size -= idx
+	}
+}
+
+func (r *ringBuffer) trimBefore(cutoff time.Time) {
+	for r.size > 0 && r.data[r.start].ts.Before(cutoff) {
+		r.start = (r.start + 1) % r.cap
+		r.size--
 	}
 }
 
@@ -85,29 +87,14 @@ func newSlidingWindow(window time.Duration, cap int) *slidingWindow {
 	if cap <= 0 {
 		cap = 16
 	}
-	return &slidingWindow{
-		buffer: newRingBuffer(cap),
-		window: window,
-	}
+	return &slidingWindow{buffer: newRingBuffer(cap), window: window}
 }
 
 func (w *slidingWindow) add(s sample) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.buffer.append(s)
-	cutoff := s.ts.Add(-w.window)
-	w.buffer.trimBefore(cutoff)
-}
-
-func (w *slidingWindow) isActive(now time.Time) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.buffer.size == 0 {
-		return false
-	}
-	cutoff := now.Add(-w.window)
-	samples := w.buffer.slice()
-	return samples[len(samples)-1].ts.After(cutoff)
+	w.buffer.trimBeforeFast(s.ts.Add(-w.window))
 }
 
 // last 返回窗口中最后一个样本的时间戳，如果没有样本返回零时间并返回 false
@@ -117,8 +104,8 @@ func (w *slidingWindow) last() (time.Time, bool) {
 	if w.buffer.size == 0 {
 		return time.Time{}, false
 	}
-	samples := w.buffer.slice()
-	return samples[len(samples)-1].ts, true
+	idx := (w.buffer.start + w.buffer.size - 1) % w.buffer.cap
+	return w.buffer.data[idx].ts, true
 }
 
 func (w *slidingWindow) metrics() (jitter float64, avgInterval float64) {
@@ -153,31 +140,73 @@ func (w *slidingWindow) metrics() (jitter float64, avgInterval float64) {
 	return
 }
 
-//
-// ---------------------- Prometheus 指标 ----------------------
-//
+func (w *slidingWindow) metricsFast() (jitter float64, avgInterval float64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.buffer.size < 3 {
+		return 0, 0
+	}
+	var sum, jitterSum float64
+	var prev, prevIv float64
+	for i := 0; i < w.buffer.size; i++ {
+		idx := (w.buffer.start + i) % w.buffer.cap
+		if i == 0 {
+			prev = float64(w.buffer.data[idx].ts.UnixNano()) / 1e6
+			continue
+		}
+		cur := float64(w.buffer.data[idx].ts.UnixNano()) / 1e6
+		iv := cur - prev
+		sum += iv
+		if i > 1 {
+			jitterSum += abs(iv - prevIv)
+		}
+		prevIv = iv
+		prev = cur
+	}
+	n := float64(w.buffer.size - 1)
+	avgInterval = sum / n
+	if n > 1 {
+		jitter = jitterSum / (n - 1)
+	}
+	return
+}
+
+// ---------------------- Prometheus ----------------------
 
 var (
-	udpJitterSummary = prometheus.NewSummary(prometheus.SummaryOpts{
-		Name:       "udp_jitter_ms_summary",
-		Help:       "Jitter distribution across all active UDP clients (ms).",
-		Objectives: map[float64]float64{0.5: 0.01, 0.9: 0.01, 0.99: 0.001},
+	udpJitterAvgGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_jitter_ms_avg",
+		Help: "Average jitter (ms) over the last window duration across all active UDP clients.",
 	})
 
-	udpIntervalSummary = prometheus.NewSummary(prometheus.SummaryOpts{
-		Name:       "udp_interval_ms_summary",
-		Help:       "Packet inter-arrival interval distribution across all clients (ms).",
-		Objectives: map[float64]float64{0.5: 0.01, 0.9: 0.01, 0.99: 0.001},
+	udpJitterPercentileGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "udp_jitter_ms_percentile",
+		Help: "Percentile jitter (ms) over the last window duration across all active UDP clients.",
+	}, []string{"percentile"})
+
+	udpIntervalAvgGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_interval_ms_avg",
+		Help: "Average packet interval (ms) over the last window duration across all active UDP clients.",
 	})
+
+	udpIntervalPercentileGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "udp_interval_ms_percentile",
+		Help: "Percentile packet interval (ms) over the last window duration across all active UDP clients.",
+	}, []string{"percentile"})
 
 	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
 		Help: "Number of active UDP clients.",
 	})
 
-	activeStreamsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "udp_active_streams",
-		Help: "Number of active UDP streams.",
+	mapSizeGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_clients_map_size",
+		Help: "Number of current client map size.",
+	})
+
+	expiredClientsCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "udp_inactive_clients_removed_total",
+		Help: "Total number of UDP clients removed due to inactivity.",
 	})
 
 	droppedClientsCounter = prometheus.NewCounter(prometheus.CounterOpts{
@@ -186,20 +215,20 @@ var (
 	})
 )
 
-//
-// ---------------------- 主程序入口 ----------------------
-//
+// ---------------------- 主逻辑 ----------------------
 
 func main() {
 	// 参数定义
 	mode := flag.String("mode", "pcap", "Capture mode: 'pcap' or 'afpacket'")
 	iface := flag.String("iface", "eth0", "Network interface to capture")
 	window := flag.Duration("window", 30*time.Second, "Sliding window duration (e.g. 30s, 1m)")
+	inactiveTimeout := flag.Duration("inactive_timeout", 2*time.Minute, "Remove clients inactive for this duration")
 	metricsAddr := flag.String("metrics", ":2112", "Prometheus metrics HTTP listen address")
 	filterPorts := flag.String("filter_ports", "", "Comma-separated UDP ports to filter (e.g. '9000,9001')")
-	maxClients := flag.Int("max_clients", 100, "Maximum number of tracked clients")
+	maxClients := flag.Int("max_clients", 1000, "Maximum number of tracked clients")
 	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window (base 1024)")
-	debug := flag.Bool("debug", false, "Enable debug logging")
+	percentileArg := flag.Float64("percentile", 90, "Percentile for jitter/interval metrics (e.g. 90, 95, 99)")
+	// debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
 	// ---------------------- 端口过滤 ----------------------
@@ -229,15 +258,18 @@ func main() {
 	// ---------------------- Prometheus 注册 ----------------------
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
-		udpJitterSummary,
-		udpIntervalSummary,
+		udpJitterAvgGauge,
+		udpJitterPercentileGauge,
+		udpIntervalAvgGauge,
+		udpIntervalPercentileGauge,
 		activeClientsGauge,
-		activeStreamsGauge,
+		mapSizeGauge,
+		expiredClientsCounter,
 		droppedClientsCounter,
 	)
 
-	clientWindows := make(map[string]*slidingWindow)
-	var mu sync.RWMutex
+	clientWindows := sync.Map{}
+	pendingClients := sync.Map{} // 防止短流创建
 
 	// buffer capacity multiplier: base 1024 * times
 	windowBufferCap := 1024 * (*windowBufferCapTimes)
@@ -245,56 +277,59 @@ func main() {
 		windowBufferCap = 1024
 	}
 
-	// ---------------------- 指标定时更新 ----------------------
+	// 统计循环
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		for range t.C {
 			now := time.Now()
-			mu.Lock()
-			activeClients := 0
-			activeStreams := 0
-			// 遍历 clientWindows
-			for client, win := range clientWindows {
-				if !win.isActive(now) {
-					// 超过窗口范围，删除
-					delete(clientWindows, client)
-					continue
+			var jitterVals, intervalVals []float64
+			active := 0
+			size := 0
+			clientWindows.Range(func(key, val any) bool {
+				size++
+				win := val.(*slidingWindow)
+				last, ok := win.last()
+				if !ok || now.Sub(last) > *inactiveTimeout {
+					clientWindows.Delete(key)
+					expiredClientsCounter.Inc()
+					return true
 				}
-				jitter, interval := win.metrics()
-
-				// 探测包过滤逻辑（简单版：窗口内样本数少于 3 认为是探测/异常）
-				win.mu.Lock()
-				isProbe := win.buffer.size < 3
-				win.mu.Unlock()
-				if isProbe {
-					continue
-				}
-
-				// 汇总全局分布
+				jitter, interval := win.metricsFast()
 				if jitter > 0 {
-					udpJitterSummary.Observe(jitter)
+					jitterVals = append(jitterVals, jitter)
 				}
 				if interval > 0 {
-					udpIntervalSummary.Observe(interval)
+					intervalVals = append(intervalVals, interval)
 				}
+				active++
+				return true
+			})
+			activeClientsGauge.Set(float64(active))
+			mapSizeGauge.Set(float64(size))
 
-				activeClients++
+			p := *percentileArg
+			pLabel := fmt.Sprintf("%.0f", p)
 
-				// 如果最近一个包在 1 秒内，则认为是活跃流
-				if last, ok := win.last(); ok {
-					if now.Sub(last) < 1*time.Second {
-						activeStreams++
-					}
-				}
+			// 更新统计 Gauge
+			if len(jitterVals) > 0 {
+				udpJitterAvgGauge.Set(mean(jitterVals))
+				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(percentile(jitterVals, p))
+			} else {
+				udpJitterAvgGauge.Set(0)
+				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(0)
 			}
-			activeClientsGauge.Set(float64(activeClients))
-			activeStreamsGauge.Set(float64(activeStreams))
-			mu.Unlock()
+
+			if len(intervalVals) > 0 {
+				udpIntervalAvgGauge.Set(mean(intervalVals))
+				udpIntervalPercentileGauge.WithLabelValues(pLabel).Set(percentile(intervalVals, p))
+			} else {
+				udpIntervalAvgGauge.Set(0)
+				udpIntervalPercentileGauge.WithLabelValues(pLabel).Set(0)
+			}
 		}
 	}()
 
-	// ---------------------- 通用包处理函数 ----------------------
 	handlePacket := func(packet gopacket.Packet) {
 		network := packet.NetworkLayer()
 		transport := packet.TransportLayer()
@@ -315,40 +350,34 @@ func main() {
 		}
 
 		srcIP := network.NetworkFlow().Src().String()
-		srcPort := udp.SrcPort.String()
-		client := fmt.Sprintf("%s:%s", srcIP, srcPort)
-
+		dstPort := udp.DstPort.String()
+		client := fmt.Sprintf("%s:%s", srcIP, dstPort)
 		meta := packet.Metadata()
 		if meta == nil {
 			return
 		}
 
-		// 时间戳过滤, 过滤掉乱序或系统异常时间戳（时间差过大）
-		if time.Since(meta.Timestamp) > 10*time.Second || meta.Timestamp.After(time.Now().Add(2*time.Second)) {
-			return
+		// 防止短流
+		_, exists := clientWindows.Load(client)
+		if !exists {
+			first, seen := pendingClients.LoadOrStore(client, meta.Timestamp)
+			if !seen {
+				return
+			}
+			if meta.Timestamp.Sub(first.(time.Time)) > 1*time.Second {
+				pendingClients.Delete(client)
+				return
+			}
+			pendingClients.Delete(client)
+			if countSyncMap(&clientWindows) >= *maxClients {
+				droppedClientsCounter.Inc()
+				return
+			}
+			clientWindows.Store(client, newSlidingWindow(*window, windowBufferCap))
 		}
 
-		// 查找或创建 window
-		mu.RLock()
-		win, ok := clientWindows[client]
-		mu.RUnlock()
-		if !ok {
-			mu.Lock()
-			// double-check
-			if win, ok = clientWindows[client]; !ok {
-				if len(clientWindows) >= *maxClients {
-					droppedClientsCounter.Inc()
-					if *debug {
-						log.Printf("Max clients reached (%d), dropping: %s", *maxClients, client)
-					}
-					mu.Unlock()
-					return
-				}
-				win = newSlidingWindow(*window, windowBufferCap)
-				clientWindows[client] = win
-			}
-			mu.Unlock()
-		}
+		val, _ := clientWindows.Load(client)
+		win := val.(*slidingWindow)
 		win.add(sample{ts: meta.Timestamp})
 	}
 
