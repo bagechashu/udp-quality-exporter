@@ -22,28 +22,9 @@ sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --max_clie
 
 ```
 
-##### Sliding Window Recommendations
-
-For audio/video call scenarios, the recommended sliding window (--window) duration is:
-
-- Common values: 30 seconds to 2 minutes are reasonable choices.
-- Industry practices:
-    - 30 seconds: Quickly reflects network state changes, suitable for real-time monitoring and alerting.
-    - 60 seconds: Smoother, suitable for statistics and trend analysis.
-    - 2 minutes or more: Good for historical statistics, but not recommended for scenarios requiring high real-time sensitivity.
-
-Suggestions:
-
-- Real-time monitoring/alerting: 30 seconds to 1 minute
-- Statistics/trend analysis: 1 to 2 minutes
-- For sparse traffic (e.g., silence periods), use 1 minute or longer.
-
-You can adjust the window length via the parameter and choose the best value for your business scenario.
-
-
 ### Testing 
 
-You can use Ncat for testing:
+- Use Ncat for testing:
 
 ```bash
 # Server：
@@ -51,5 +32,8 @@ nc -l -u -p 9000
 
 # Client：
 nc -u <server-ip> 9000
+
+# metrics
+curl http://localhost:2112/metrics
 
 ```
