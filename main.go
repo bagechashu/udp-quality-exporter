@@ -31,35 +31,36 @@ var (
 		Help: "Percentile packet interval (ms) over the last window duration across all active UDP clients.",
 	}, []string{"percentile"})
 
-	udpJitterAvgGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	udpJitterAvgGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_avg",
 		Help: "Average jitter (ms) over the last window duration across all active UDP clients.",
-	})
+	}, []string{"region"})
 
 	udpJitterPercentileGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_percentile",
 		Help: "Percentile jitter (ms) over the last window duration across all active UDP clients.",
-	}, []string{"percentile"})
+	}, []string{"region", "percentile"})
 
-	udpJitterStdDevGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	udpJitterStdDevGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_stddev",
 		Help: "Standard deviation of jitter (ms) over the last window duration across all active UDP clients.",
-	})
+	}, []string{"region"})
 
-	udpJitterVarianceGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	udpJitterVarianceGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_variance",
 		Help: "Variance of jitter (ms^2) over the last window duration across all active UDP clients.",
-	})
+	}, []string{"region"})
 
-	udpJitterCVGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	udpJitterCVGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_cv",
 		Help: "Coefficient of variation (stddev/mean) of jitter (ms) across all active UDP clients.",
-	})
+	}, []string{"region"})
 
-	udpJitterMADGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	udpJitterMADGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_mad",
 		Help: "Mean absolute deviation of jitter (ms) over the last window duration across all active UDP clients.",
-	})
+	}, []string{"region"})
+
 	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
 		Help: "Number of active UDP clients.",
@@ -99,6 +100,7 @@ func main() {
 	maxClients := flag.Int("max_clients", 1000, "Maximum number of tracked clients")
 	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window (base 1024)")
 	percentileArg := flag.Float64("percentile", 90, "Percentile for jitter/interval metrics (e.g. 90, 95, 99)")
+	geoLiteDBPath := flag.String("geoip_db", "./GeoLite2-Country.mmdb", "Path to GeoLite2 Country database")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	pendingTTL := flag.Duration("pending_ttl", 2*time.Second, "TTL for pending clients waiting for second packet")
 	pprofAddr := flag.String("pprof", ":6060", "pprof listen address, (only in debug mode)")
@@ -193,11 +195,13 @@ func main() {
 		defer t.Stop()
 		for range t.C {
 			now := time.Now()
-			var jitterVals, intervalVals []float64
+			countryJitterVals := make(map[string][]float64)
+			var intervalVals []float64
 			active := 0
 			size := 0
 			clientWindows.Range(func(key, val any) bool {
 				size++
+				client := key.(string)
 				win := val.(*slidingWindow)
 				last, ok := win.last()
 				if !ok || now.Sub(last) > *inactiveTimeout {
@@ -207,7 +211,8 @@ func main() {
 				}
 				jitter, interval := win.metricsFast()
 				if jitter > 0 {
-					jitterVals = append(jitterVals, jitter)
+					country := GetCountryByIPLocal(strings.Split(client, ":")[0], *geoLiteDBPath)
+					countryJitterVals[country] = append(countryJitterVals[country], jitter)
 				}
 				if interval > 0 {
 					intervalVals = append(intervalVals, interval)
@@ -222,28 +227,29 @@ func main() {
 			pLabel := fmt.Sprintf("%.0f", p)
 
 			// 更新统计 Gauge
-			if len(jitterVals) > 0 {
-				avg := mean(jitterVals)
-				std := stddev(jitterVals)
-				varianceVal := variance(jitterVals)
-				cv := coefficientOfVariation(jitterVals)
-				madVal := mad(jitterVals)
+			for c, jitterVals := range countryJitterVals {
+				if len(jitterVals) > 0 {
+					avg := mean(jitterVals)
+					std := stddev(jitterVals)
+					varianceVal := variance(jitterVals)
+					cv := coefficientOfVariation(jitterVals)
+					madVal := mad(jitterVals)
 
-				udpJitterAvgGauge.Set(avg)
-				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(percentile(jitterVals, p))
-				udpJitterStdDevGauge.Set(std)
-				udpJitterVarianceGauge.Set(varianceVal)
-				udpJitterCVGauge.Set(cv)
-				udpJitterMADGauge.Set(madVal)
-			} else {
-				udpJitterAvgGauge.Set(0)
-				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(0)
-				udpJitterStdDevGauge.Set(0)
-				udpJitterVarianceGauge.Set(0)
-				udpJitterCVGauge.Set(0)
-				udpJitterMADGauge.Set(0)
+					udpJitterAvgGauge.WithLabelValues(c).Set(avg)
+					udpJitterPercentileGauge.WithLabelValues(c, pLabel).Set(percentile(jitterVals, p))
+					udpJitterStdDevGauge.WithLabelValues(c).Set(std)
+					udpJitterVarianceGauge.WithLabelValues(c).Set(varianceVal)
+					udpJitterCVGauge.WithLabelValues(c).Set(cv)
+					udpJitterMADGauge.WithLabelValues(c).Set(madVal)
+				} else {
+					udpJitterAvgGauge.WithLabelValues(c).Set(0)
+					udpJitterPercentileGauge.WithLabelValues(c, pLabel).Set(0)
+					udpJitterStdDevGauge.WithLabelValues(c).Set(0)
+					udpJitterVarianceGauge.WithLabelValues(c).Set(0)
+					udpJitterCVGauge.WithLabelValues(c).Set(0)
+					udpJitterMADGauge.WithLabelValues(c).Set(0)
+				}
 			}
-
 			if len(intervalVals) > 0 {
 				udpIntervalAvgGauge.Set(mean(intervalVals))
 				udpIntervalPercentileGauge.WithLabelValues(pLabel).Set(percentile(intervalVals, p))
