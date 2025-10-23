@@ -61,10 +61,10 @@ var (
 		Help: "Mean absolute deviation of jitter (ms) over the last window duration across all active UDP clients.",
 	}, []string{"region"})
 
-	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+	activeClientsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
 		Help: "Number of active UDP clients.",
-	})
+	}, []string{"region"})
 
 	mapSizeGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_clients_map_size",
@@ -195,9 +195,9 @@ func main() {
 		defer t.Stop()
 		for range t.C {
 			now := time.Now()
-			countryJitterVals := make(map[string][]float64)
 			var intervalVals []float64
-			active := 0
+			countryJitterVals := make(map[string][]float64)
+			countryActive := make(map[string]int)
 			size := 0
 			clientWindows.Range(func(key, val any) bool {
 				size++
@@ -213,20 +213,24 @@ func main() {
 				if jitter > 0 {
 					country := GetCountryByIPLocal(strings.Split(client, ":")[0], *geoLiteDBPath)
 					countryJitterVals[country] = append(countryJitterVals[country], jitter)
+					countryActive[country]++
 				}
 				if interval > 0 {
 					intervalVals = append(intervalVals, interval)
 				}
-				active++
 				return true
 			})
-			activeClientsGauge.Set(float64(active))
-			mapSizeGauge.Set(float64(size))
 
 			p := *percentileArg
 			pLabel := fmt.Sprintf("%.0f", p)
 
 			// 更新统计 Gauge
+			mapSizeGauge.Set(float64(size))
+			for c, active := range countryActive {
+				activeClientsGauge.WithLabelValues(c).Set(float64(active))
+			}
+
+			// 更新 jitter 相关 Gauge
 			for c, jitterVals := range countryJitterVals {
 				if len(jitterVals) > 0 {
 					avg := mean(jitterVals)
@@ -250,6 +254,8 @@ func main() {
 					udpJitterMADGauge.WithLabelValues(c).Set(0)
 				}
 			}
+
+			// 更新 interval 相关 Gauge
 			if len(intervalVals) > 0 {
 				udpIntervalAvgGauge.Set(mean(intervalVals))
 				udpIntervalPercentileGauge.WithLabelValues(pLabel).Set(percentile(intervalVals, p))
