@@ -58,7 +58,7 @@ var (
 
 	udpJitterMADGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_mad",
-		Help: "Mean absolute deviation of jitter (ms) over the last window duration across all active UDP clients.",
+		Help: "Median Absolute Deviation of jitter (ms) over the last window duration across all active UDP clients.",
 	}, []string{"region"})
 
 	activeClientsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -94,15 +94,16 @@ func main() {
 	mode := flag.String("mode", "pcap", "Capture mode: 'pcap' or 'afpacket'")
 	iface := flag.String("iface", "eth0", "Network interface to capture")
 	window := flag.Duration("window", 30*time.Second, "Sliding window duration (e.g. 30s, 1m)")
+	metricsRefresh := flag.Duration("metrics_refresh", 30*time.Second, "Metrics refresh interval")
 	inactiveTimeout := flag.Duration("inactive_timeout", 2*time.Minute, "Remove clients inactive for this duration")
-	metricsAddr := flag.String("metrics", ":2112", "Prometheus metrics HTTP listen address")
+	metricsAddr := flag.String("metrics_addr", ":2112", "Prometheus metrics HTTP listen address")
 	filterPorts := flag.String("filter_ports", "", "Comma-separated UDP ports to filter (e.g. '9000,9001')")
 	maxClients := flag.Int("max_clients", 1000, "Maximum number of tracked clients")
 	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window (base 1024)")
 	percentileArg := flag.Float64("percentile", 90, "Percentile for jitter/interval metrics (e.g. 90, 95, 99)")
 	geoLiteDBPath := flag.String("geoip_db", "./GeoLite2-Country.mmdb", "Path to GeoLite2 Country database")
 	debug := flag.Bool("debug", false, "Enable debug logging")
-	pendingTTL := flag.Duration("pending_ttl", 2*time.Second, "TTL for pending clients waiting for second packet")
+	pendingTTL := flag.Duration("pending_ttl", 10*time.Second, "TTL for pending clients waiting for second packet")
 	pprofAddr := flag.String("pprof", ":6060", "pprof listen address, (only in debug mode)")
 	flag.Parse()
 
@@ -191,7 +192,7 @@ func main() {
 
 	// 统计循环
 	go func() {
-		t := time.NewTicker(1 * time.Second)
+		t := time.NewTicker(*metricsRefresh)
 		defer t.Stop()
 		for range t.C {
 			now := time.Now()
@@ -237,7 +238,7 @@ func main() {
 					std := stddev(jitterVals)
 					varianceVal := variance(jitterVals)
 					cv := coefficientOfVariation(jitterVals)
-					madVal := mad(jitterVals)
+					madVal := medianAD(jitterVals)
 
 					udpJitterAvgGauge.WithLabelValues(c).Set(avg)
 					udpJitterPercentileGauge.WithLabelValues(c, pLabel).Set(percentile(jitterVals, p))

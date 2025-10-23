@@ -15,10 +15,10 @@ env GOOS=linux GOARCH=amd64 go build -tags pcap -o udp-quality-exporter
 env GOOS=linux GOARCH=amd64 go build -o udp-quality-exporter
 
 # Capture UDP packets on eth0 port 9000, 30s sliding window, Prometheus metrics exposed on port 2112
-sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --filter_ports 9000,9001
+sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics_addr :2112 --filter_ports 9000,9001
 
 # Default values
-sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics :2112 --max_clients 100 --window_buffer_cap 1 --percentile 90 --mode pcap --debug
+sudo ./udp-quality-exporter --iface eth0 --window 30s --metrics_refresh 30s --metrics_addr :2112 --max_clients 100 --window_buffer_cap 1 --percentile 90 --mode pcap --debug
 
 ```
 

@@ -69,8 +69,8 @@ func coefficientOfVariation(xs []float64) float64 {
 	return stddev(xs) / m
 }
 
-// mad 计算平均绝对偏差
-func mad(xs []float64) float64 {
+// Mean Absolute Deviation（平均绝对偏差）
+func meanAD(xs []float64) float64 {
 	if len(xs) == 0 {
 		return 0
 	}
@@ -80,6 +80,30 @@ func mad(xs []float64) float64 {
 		sum += abs(x - m)
 	}
 	return sum / float64(len(xs))
+}
+
+// Median Absolute Deviation（中位数绝对偏差）
+func medianAD(xs []float64) float64 {
+	m := median(xs)
+	devs := make([]float64, len(xs))
+	for i, x := range xs {
+		devs[i] = abs(x - m)
+	}
+	return median(devs)
+}
+
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	cp := make([]float64, len(xs))
+	copy(cp, xs)
+	sort.Float64s(cp)
+	mid := len(cp) / 2
+	if len(cp)%2 == 0 {
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+	return cp[mid]
 }
 
 func countSyncMap(m *sync.Map) int {

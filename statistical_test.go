@@ -88,15 +88,62 @@ func TestCoefficientOfVariation(t *testing.T) {
 	}
 }
 
-func TestMad(t *testing.T) {
-	data := []float64{1, 2, 3, 4, 5}
-	wantMad := (abs(1-3) + abs(2-3) + abs(3-3) + abs(4-3) + abs(5-3)) / 5
-	if got := mad(data); !almostEqual(got, wantMad) {
-		t.Errorf("mad(%v) = %v, want %v", data, got, wantMad)
+func TestMedian(t *testing.T) {
+	tests := []struct {
+		input []float64
+		want  float64
+	}{
+		// 奇数个元素
+		{[]float64{1, 2, 3}, 2},
+		{[]float64{3, 1, 2}, 2},
+		{[]float64{5}, 5},
+
+		// 偶数个元素
+		{[]float64{1, 2, 3, 4}, 2.5},
+		{[]float64{4, 3, 2, 1}, 2.5},
+
+		// 包含重复值
+		{[]float64{2, 2, 2, 2}, 2},
+
+		// 空数组
+		{[]float64{}, 0},
 	}
 
-	if got := mad([]float64{}); !almostEqual(got, 0) {
-		t.Errorf("mad(empty) = %v, want 0", got)
+	for _, tt := range tests {
+		if got := median(tt.input); !almostEqual(got, tt.want) {
+			t.Errorf("median(%v) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestMedianAD(t *testing.T) {
+	tests := []struct {
+		input []float64
+		want  float64
+	}{
+		// 基本对称分布
+		{[]float64{1, 2, 3, 4, 5}, 1},
+
+		// 奇数个元素，偏移数据
+		{[]float64{10, 20, 30}, 10},
+
+		// 偶数个元素
+		{[]float64{1, 1, 2, 2}, 0.5},
+
+		// 含有极值
+		{[]float64{1, 100, 101, 102, 103}, 1},
+
+		// 空数组
+		{[]float64{}, 0},
+
+		// 全相等
+		{[]float64{3, 3, 3, 3}, 0},
+	}
+
+	for _, tt := range tests {
+		if got := medianAD(tt.input); !almostEqual(got, tt.want) {
+			t.Errorf("medianAD(%v) = %v, want %v", tt.input, got, tt.want)
+		}
 	}
 }
 
