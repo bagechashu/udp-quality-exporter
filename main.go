@@ -56,6 +56,10 @@ var (
 		Help: "Coefficient of variation (stddev/mean) of jitter (ms) across all active UDP clients.",
 	})
 
+	udpJitterMADGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_jitter_ms_mad",
+		Help: "Mean absolute deviation of jitter (ms) over the last window duration across all active UDP clients.",
+	})
 	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
 		Help: "Number of active UDP clients.",
@@ -134,6 +138,7 @@ func main() {
 		udpJitterStdDevGauge,
 		udpJitterVarianceGauge,
 		udpJitterCVGauge,
+		udpJitterMADGauge,
 		activeClientsGauge,
 		mapSizeGauge,
 		expiredClientsCounter,
@@ -222,18 +227,21 @@ func main() {
 				std := stddev(jitterVals)
 				varianceVal := variance(jitterVals)
 				cv := coefficientOfVariation(jitterVals)
+				madVal := mad(jitterVals)
 
 				udpJitterAvgGauge.Set(avg)
 				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(percentile(jitterVals, p))
 				udpJitterStdDevGauge.Set(std)
 				udpJitterVarianceGauge.Set(varianceVal)
 				udpJitterCVGauge.Set(cv)
+				udpJitterMADGauge.Set(madVal)
 			} else {
 				udpJitterAvgGauge.Set(0)
 				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(0)
 				udpJitterStdDevGauge.Set(0)
 				udpJitterVarianceGauge.Set(0)
 				udpJitterCVGauge.Set(0)
+				udpJitterMADGauge.Set(0)
 			}
 
 			if len(intervalVals) > 0 {

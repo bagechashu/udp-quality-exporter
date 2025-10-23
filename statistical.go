@@ -69,6 +69,19 @@ func coefficientOfVariation(xs []float64) float64 {
 	return stddev(xs) / m
 }
 
+// mad 计算平均绝对偏差
+func mad(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	m := mean(xs)
+	var sum float64
+	for _, x := range xs {
+		sum += abs(x - m)
+	}
+	return sum / float64(len(xs))
+}
+
 func countSyncMap(m *sync.Map) int {
 	n := 0
 	m.Range(func(_, _ any) bool {
