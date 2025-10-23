@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,6 +21,16 @@ import (
 // ---------------------- Prometheus ----------------------
 
 var (
+	udpIntervalAvgGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_interval_ms_avg",
+		Help: "Average packet interval (ms) over the last window duration across all active UDP clients.",
+	})
+
+	udpIntervalPercentileGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "udp_interval_ms_percentile",
+		Help: "Percentile packet interval (ms) over the last window duration across all active UDP clients.",
+	}, []string{"percentile"})
+
 	udpJitterAvgGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_avg",
 		Help: "Average jitter (ms) over the last window duration across all active UDP clients.",
@@ -30,15 +41,20 @@ var (
 		Help: "Percentile jitter (ms) over the last window duration across all active UDP clients.",
 	}, []string{"percentile"})
 
-	udpIntervalAvgGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "udp_interval_ms_avg",
-		Help: "Average packet interval (ms) over the last window duration across all active UDP clients.",
+	udpJitterStdDevGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_jitter_ms_stddev",
+		Help: "Standard deviation of jitter (ms) over the last window duration across all active UDP clients.",
 	})
 
-	udpIntervalPercentileGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "udp_interval_ms_percentile",
-		Help: "Percentile packet interval (ms) over the last window duration across all active UDP clients.",
-	}, []string{"percentile"})
+	udpJitterVarianceGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_jitter_ms_variance",
+		Help: "Variance of jitter (ms^2) over the last window duration across all active UDP clients.",
+	})
+
+	udpJitterCVGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_jitter_ms_cv",
+		Help: "Coefficient of variation (stddev/mean) of jitter (ms) across all active UDP clients.",
+	})
 
 	activeClientsGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
@@ -59,6 +75,11 @@ var (
 		Name: "udp_dropped_clients_total",
 		Help: "Total number of UDP clients dropped due to max_clients limit.",
 	})
+
+	pendingClientsSizeGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "udp_pending_clients_size",
+		Help: "Number of pending_clients waiting for second packet.",
+	})
 )
 
 // ---------------------- 主逻辑 ----------------------
@@ -74,7 +95,9 @@ func main() {
 	maxClients := flag.Int("max_clients", 1000, "Maximum number of tracked clients")
 	windowBufferCapTimes := flag.Int("window_buffer_cap", 1, "Multiplier for buffered samples in sliding window (base 1024)")
 	percentileArg := flag.Float64("percentile", 90, "Percentile for jitter/interval metrics (e.g. 90, 95, 99)")
-	// debug := flag.Bool("debug", false, "Enable debug logging")
+	debug := flag.Bool("debug", false, "Enable debug logging")
+	pendingTTL := flag.Duration("pending_ttl", 2*time.Second, "TTL for pending clients waiting for second packet")
+	pprofAddr := flag.String("pprof", ":6060", "pprof listen address, (only in debug mode)")
 	flag.Parse()
 
 	// ---------------------- 端口过滤 ----------------------
@@ -104,14 +127,18 @@ func main() {
 	// ---------------------- Prometheus 注册 ----------------------
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
-		udpJitterAvgGauge,
-		udpJitterPercentileGauge,
 		udpIntervalAvgGauge,
 		udpIntervalPercentileGauge,
+		udpJitterAvgGauge,
+		udpJitterPercentileGauge,
+		udpJitterStdDevGauge,
+		udpJitterVarianceGauge,
+		udpJitterCVGauge,
 		activeClientsGauge,
 		mapSizeGauge,
 		expiredClientsCounter,
 		droppedClientsCounter,
+		pendingClientsSizeGauge,
 	)
 
 	clientWindows := sync.Map{}
@@ -121,6 +148,38 @@ func main() {
 	windowBufferCap := 1024 * (*windowBufferCapTimes)
 	if windowBufferCap <= 0 {
 		windowBufferCap = 1024
+	}
+
+	// ---------------------- pendingClients 清理 Goroutine ----------------------
+	if *pendingTTL > 0 {
+		go func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for range t.C {
+				now := time.Now()
+				var pendingCount int
+				pendingClients.Range(func(k, v any) bool {
+					pendingCount++
+					ts := v.(time.Time)
+					if now.Sub(ts) > *pendingTTL {
+						pendingClients.Delete(k)
+					}
+					return true
+				})
+				pendingClientsSizeGauge.Set(float64(pendingCount))
+			}
+		}()
+	}
+
+	// ---------------------- pprof server（可选） ----------------------
+	if *debug {
+		go func() {
+			// pprof on separate port; note: net/http/pprof imported for side effects
+			log.Printf("pprof listening on %s (for heap/cpu profiles)", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("pprof server error: %v", err)
+			}
+		}()
 	}
 
 	// 统计循环
@@ -159,11 +218,22 @@ func main() {
 
 			// 更新统计 Gauge
 			if len(jitterVals) > 0 {
-				udpJitterAvgGauge.Set(mean(jitterVals))
+				avg := mean(jitterVals)
+				std := stddev(jitterVals)
+				varianceVal := variance(jitterVals)
+				cv := coefficientOfVariation(jitterVals)
+
+				udpJitterAvgGauge.Set(avg)
 				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(percentile(jitterVals, p))
+				udpJitterStdDevGauge.Set(std)
+				udpJitterVarianceGauge.Set(varianceVal)
+				udpJitterCVGauge.Set(cv)
 			} else {
 				udpJitterAvgGauge.Set(0)
 				udpJitterPercentileGauge.WithLabelValues(pLabel).Set(0)
+				udpJitterStdDevGauge.Set(0)
+				udpJitterVarianceGauge.Set(0)
+				udpJitterCVGauge.Set(0)
 			}
 
 			if len(intervalVals) > 0 {
@@ -203,18 +273,22 @@ func main() {
 			return
 		}
 
-		// 防止短流
+		// 防止短流（改进：保留原逻辑，并依赖上面清理 goroutine 清理过期 pending）
 		_, exists := clientWindows.Load(client)
 		if !exists {
 			first, seen := pendingClients.LoadOrStore(client, meta.Timestamp)
 			if !seen {
+				// 第一次见到，先记录时间，等待下一包
 				return
 			}
+			// seen == true: second packet
+			// 如果时间间隔过大，也清理并返回（保持你的原逻辑）
 			if meta.Timestamp.Sub(first.(time.Time)) > 1*time.Second {
 				pendingClients.Delete(client)
 				return
 			}
 			pendingClients.Delete(client)
+			// 防止超过最大 client 限制
 			if countSyncMap(&clientWindows) >= *maxClients {
 				droppedClientsCounter.Inc()
 				return
@@ -222,7 +296,11 @@ func main() {
 			clientWindows.Store(client, newSlidingWindow(*window, windowBufferCap))
 		}
 
-		val, _ := clientWindows.Load(client)
+		val, ok := clientWindows.Load(client)
+		if !ok {
+			// 极端并发情况下可能已被删除/未创建，安全处理
+			return
+		}
 		win := val.(*slidingWindow)
 		win.add(sample{ts: meta.Timestamp})
 	}
@@ -247,9 +325,12 @@ func main() {
 	}()
 
 	// ---------------------- 启动 Prometheus HTTP ----------------------
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
 	server := &http.Server{
 		Addr:        *metricsAddr,
-		Handler:     promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		Handler:     mux,
 		ReadTimeout: 5 * time.Second,
 		IdleTimeout: 5 * time.Second,
 	}

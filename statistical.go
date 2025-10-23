@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"sort"
 	"sync"
 )
@@ -38,6 +39,34 @@ func percentile(xs []float64, p float64) float64 {
 		k = len(cp) - 1
 	}
 	return cp[k]
+}
+
+// variance 方差（Variance）
+func variance(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	m := mean(xs)
+	var sum float64
+	for _, x := range xs {
+		d := x - m
+		sum += d * d
+	}
+	return sum / float64(len(xs))
+}
+
+// stddev 标准差（Standard Deviation）
+func stddev(xs []float64) float64 {
+	return math.Sqrt(variance(xs))
+}
+
+// coefficientOfVariation 变异系数（Coefficient of Variation, CV）
+func coefficientOfVariation(xs []float64) float64 {
+	m := mean(xs)
+	if m == 0 {
+		return 0
+	}
+	return stddev(xs) / m
 }
 
 func countSyncMap(m *sync.Map) int {

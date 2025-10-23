@@ -37,3 +37,10 @@ nc -u <server-ip> 9000
 curl http://localhost:2112/metrics
 
 ```
+
+### Pprof
+
+```
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap
+
+```
