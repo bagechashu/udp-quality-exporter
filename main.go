@@ -34,37 +34,37 @@ var (
 	udpJitterAvgGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_avg",
 		Help: "Average jitter (ms) over the last window duration across all active UDP clients.",
-	}, []string{"region"})
+	}, []string{"country"})
 
 	udpJitterPercentileGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_percentile",
 		Help: "Percentile jitter (ms) over the last window duration across all active UDP clients.",
-	}, []string{"region", "percentile"})
+	}, []string{"country", "percentile"})
 
 	udpJitterStdDevGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_stddev",
 		Help: "Standard deviation of jitter (ms) over the last window duration across all active UDP clients.",
-	}, []string{"region"})
+	}, []string{"country"})
 
 	udpJitterVarianceGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_variance",
 		Help: "Variance of jitter (ms^2) over the last window duration across all active UDP clients.",
-	}, []string{"region"})
+	}, []string{"country"})
 
 	udpJitterCVGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_cv",
 		Help: "Coefficient of variation (stddev/mean) of jitter (ms) across all active UDP clients.",
-	}, []string{"region"})
+	}, []string{"country"})
 
 	udpJitterMADGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_jitter_ms_mad",
 		Help: "Median Absolute Deviation of jitter (ms) over the last window duration across all active UDP clients.",
-	}, []string{"region"})
+	}, []string{"country"})
 
 	activeClientsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "udp_active_clients",
 		Help: "Number of active UDP clients.",
-	}, []string{"region"})
+	}, []string{"country"})
 
 	mapSizeGauge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "udp_clients_map_size",
